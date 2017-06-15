@@ -1,0 +1,6 @@
+[submodule "ps-lite"]
+	path = ps-lite
+	url = https://github.com/dmlc/ps-lite.git
+[submodule "eigen"]
+	path = eigen
+	url = https://github.com/RLovelett/eigen
