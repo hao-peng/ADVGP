@@ -12,16 +12,24 @@ using namespace std::chrono;
 
 //const double PI = acos(-1.0);
 
+
+// TODO: could replace this with protobuf
 class Config {
 public:
-  int _m;
-  int _d;
-  int _maxDelay;
-  int _maxPush;
-  int _maxEpoch;
-  double _tau;
+  int _m;  // number of inducing inputs
+  int _d;  // dimension of inputs
+  int _maxDelay; // maximum delay allowed for asynchronous updates
+  int _maxPush;  // maximum number of pushes before wait
+  int _maxEpoch; // maximum number of epoches
+
+  // parameters for adadelta
+  // see paper https://arxiv.org/pdf/1212.5701.pdf
+  double _tau; // rho in the paper 
   double _eps;
-  double _fixedJitter;
+  
+  double _fixedJitter; // fixed jitter for numerical stability 
+
+  // paths for inputs and outputs
   std::string _trainFilePath;
   std::string _testFilePath;
   std::string _paramFilePath;
@@ -33,7 +41,7 @@ public:
   size_t _sfOffset;
   size_t _bOffset;
   size_t _wMuOffset;
-  size_t _wCholSOffset;
+  size_t _wCholSOffset;  // only store the upper triangular parts for wCholS
   size_t _paramSize;
   size_t _lossOffset;
   size_t _epochOffset;
@@ -41,6 +49,9 @@ public:
   size_t _totalKeys;
 
   Config() : _m(0), _d(0) {}
+  // Read the configuration from a file located at configFilePath.
+  // This is a simple function which assumes that the inputs are stictly
+  // ordered. Lines begin with # are comments.
   void Load(std::string configFilePath) {
     std::ifstream ifs(configFilePath.c_str(), std::ifstream::in);
     int line = 0;
@@ -73,6 +84,7 @@ public:
     _bOffset      = _sfOffset     + 1;
     _wMuOffset    = _bOffset      + _d * _m;
     _wCholSOffset = _wMuOffset    + _m; 
+    // only store the upper triangular parts for wCholS
     _paramSize    = _wCholSOffset + _m * (_m + 1) / 2;
     _lossOffset   = _paramSize;
     _epochOffset  = _paramSize    + 1;
@@ -86,6 +98,8 @@ public:
     CHECK_GT(_tau, 0.0);
     CHECK_GT(line, 11);
   }
+
+  // This converts the configureation to a string.
   std::string toString() {
     return "# M\n" + std::to_string(_m)
        + "\n# D\n" + std::to_string(_d)
@@ -104,15 +118,15 @@ public:
 
 Config config;
 
-// distributed the keys among servers
+// use revertible mapping to distribute the keys among servers
 inline Key encryptKey(Key key) {
   return kMaxKey / config._totalKeys * key;
 }
-
 inline Key decryptKey(Key key) {
   return key / (kMaxKey / config._totalKeys);
 }
 
+// Handler for the server (it is used when a push/pull request comes)
 struct MyKVServerHandle {
   MyKVServerHandle() {
     _numTrainers = NumWorkers() - 1; 
@@ -125,7 +139,8 @@ struct MyKVServerHandle {
 
     LoadParameters();
 
-    // set the indexes for diagonals of wCholS for fast look up
+    // set the indexes for diagonals of wCholS for fast look-up
+    // see Eq. (18 - 20)
     int ind = config._wCholSOffset;
     for (int i = 0; i < config._m; i++) {
       _wSDiagInd.insert(ind);
@@ -154,7 +169,13 @@ struct MyKVServerHandle {
     CHECK_EQ(ind, config._paramSize);
   }
 
-  inline void ProcessPush(const KVMeta &req_meta, const KVPairs<double>& req_data, KVServer<double> *server, KVPairs<double> &res) {
+  // process a push request
+  // If the incoming updates are within the allowed delay, updates the
+  // parameters and process all unhanedled pull requests
+  inline void ProcessPush(const KVMeta &req_meta, 
+                          const KVPairs<double>& req_data, 
+                          KVServer<double> *server, 
+                          KVPairs<double> &res) {
     size_t n = req_data.keys.size();
     CHECK_EQ(n, req_data.vals.size());
     int rank = Postoffice::Get()->IDtoRank(req_meta.sender);
@@ -178,7 +199,7 @@ struct MyKVServerHandle {
       }
     }
 
-    // compute the max and min epoch among all workers
+    // compute the min epoch among all workers
     int minEpoch = _epochCounts.begin()->first;
 
     // only update parameter if all workers are within maxDelay
@@ -204,7 +225,7 @@ struct MyKVServerHandle {
           gradSum += _grads[j][key];
         }
 
-        // adadelta algorithm
+        // AdaDelta algorithm
         _accumGrad[key] = _accumGrad[key] * config._tau + 
                           gradSum * gradSum * (1 - config._tau);
         double stepSize = sqrt(_accumUpd[key] + config._eps) /
@@ -215,20 +236,23 @@ struct MyKVServerHandle {
                          update * update * (1 - config._tau);
 
         if (i < config._wMuOffset) {
+          // asychronous gradient updates for non-variational parameters 
           _params[key] = gradDesUpd;
         } else {
           if (_wSDiagInd.find(key) == _wSDiagInd.end()) {
             // proximal update for regular L2 loss
+            // Eq. (18) and (19) in ADVGP paper
             _params[key] = gradDesUpd / (1.0 + stepSize);
           } else {
             // different update for diagonals of wCholS
+            // Eq. (20) in ADVGP paper
             _params[key] = (gradDesUpd + sqrt(gradDesUpd * gradDesUpd 
                       + 4.0 * (1.0 + stepSize) * stepSize)) 
                       * 0.5 / ( 1.0 + stepSize);
           }
         }
       }
-    } // end of loop over all keys
+    }  // end of loop over all keys
     
     // process unhandled pull requests
     std::vector<int> toDel;
@@ -245,9 +269,15 @@ struct MyKVServerHandle {
       _reqMetas.erase(toDel[i]);
       _reqData.erase(toDel[i]);
     }
-  }
+  }  // ProcessPush
 
-  inline void ProcessPull(const KVMeta &req_meta, const KVPairs<double>& req_data, KVServer<double> *server, KVPairs<double> &res) {
+
+  // process a pull request
+  // send all necessary information to the worker
+  inline void ProcessPull(const KVMeta &req_meta, 
+                          const KVPairs<double>& req_data, 
+                          KVServer<double> *server, 
+                          KVPairs<double> &res) {
     size_t n = req_data.keys.size();
 
     res.keys = req_data.keys;
@@ -266,10 +296,15 @@ struct MyKVServerHandle {
         res.vals[i] = _params[key];
       }
     }
-  }
+  }  // ProcessPull
 
-  void operator()(
-      const KVMeta& req_meta, const KVPairs<double>& req_data, KVServer<double>* server) {
+
+  // The function for all requests (pull/push)
+  // The req_meta.push is boolean that indicate whether it is a pull or a push
+  // req_meta.cmd stores the epoch from the worker
+  void operator()(const KVMeta& req_meta, 
+                  const KVPairs<double>& req_data, 
+                  KVServer<double>* server) {
     KVPairs<double> res;
 
     if (req_meta.push) {
@@ -277,6 +312,7 @@ struct MyKVServerHandle {
       server->Response(req_meta, res);
     } else {
       // for Pull request, send immediately if _curEpoch is larger
+      // otherwise store the pull request utill the next push update
       if (req_meta.cmd < _curEpoch) {
         ProcessPull(req_meta, req_data, server, res);
         server->Response(req_meta, res);
@@ -288,19 +324,30 @@ struct MyKVServerHandle {
     }
   }
 
+  // gradients for each parameter and for each worker
   std::vector< std::unordered_map<Key, double> > _grads;
+  // parameters (hyperperatmers and parameters of ADVGP model)
   std::unordered_map<Key, double>                _params;
+  // a helper index for fast look-up when updating gradients
   std::unordered_set<int>                        _wSDiagInd;
+  // total loss (variational lower bound)
   double                                         _loss;
+  // losses from each worker
   std::vector<double>                            _losses;
+  // current epoch for each worker
   std::vector<int>                               _epochs;
+  // stores a sorted count of epoch number (for fast look-up)
   std::map<int, int>                             _epochCounts;
+  // current epoch on server (max epoch)
   int                                            _curEpoch;
+  // start time of this server
   high_resolution_clock::time_point              _startTime;
+  // number of workers (monitors/testers excluded)
   size_t                                         _numTrainers;
+  // accumultated gradients and updates used for AdaDelta algorithm
   std::unordered_map<Key, double>                _accumGrad;
   std::unordered_map<Key, double>                _accumUpd;
-  
+  // request data for unhandled pull requests
   std::unordered_map<int, KVMeta>                _reqMetas;
   std::unordered_map<int, KVPairs<double> >      _reqData;
   
@@ -310,14 +357,15 @@ struct MyKVServerHandle {
   int _processCount;
 };
 
+// a super class for trainer and monitor/tester
 class MyWorker {
 protected:
   KVWorker<double> *_kvPtr;
   int _rank;
 
-  double _sn2;
+  double   _sn2;
   VectorXd _eta;    // d: inv(ell)^2
-  double   _sf2;
+  double   _sf2;    // 1: a0 in ADVGP paper
   MatrixXd _b;      // d by m
   VectorXd _wMu;    // m
   MatrixXd _wCholS; // m by m upper
@@ -336,7 +384,8 @@ protected:
   // dataFilePath contains the data with N rows and (D+1) cols.
   // The last col is the response variable
   // xRaw is column major D by N matrix
-  void LoadTextData(const std::string &dataFilePath, std::vector<double> &xRaw, std::vector<double> &yRaw) {
+  void LoadTextData(const std::string &dataFilePath, 
+    std::vector<double> &xRaw, std::vector<double> &yRaw) {
     xRaw.resize(0);
     yRaw.resize(0);
     std::ifstream ifs(dataFilePath, std::ifstream::in);
@@ -437,25 +486,26 @@ protected:
   VectorXd _y;      // n
   int _n;
 
+  // pre-allocated matrix/vectors 
   MatrixXd _wS;
-  MatrixXd _wSPlusWMuWMuT;
+  MatrixXd _wSPlusWMuWMuT;  //wS + wMu * wMu^T
   MatrixXd _bEta;
   MatrixXd _kmm;
   MatrixXd _knm;
-  MatrixXd _invCholInvKmm;
-  MatrixXd _cholInvKmm;
+  MatrixXd _invCholInvKmm;  // inv(chol(inv(Kmm)))
+  MatrixXd _cholInvKmm;  // chol(inv(Kmm))
   MatrixXd _phi;
-  MatrixXd _phi2;
-  MatrixXd _phiPhi;
-  RowVectorXd _yPhi;
+  MatrixXd _phi2;  // _phi .* _phi
+  MatrixXd _phiPhi;  // _phi^T * _phi
+  RowVectorXd _yPhi;  // _y * _phi
   MatrixXd _psi;
-  MatrixXd _x2;
-  MatrixXd _b2;
-  MatrixXd _e; //-m*y'+(m*m'+wS)*phi'-phi' 
+  MatrixXd _x2;  // _x .* _x
+  MatrixXd _b2;  // _b .* _b
+  MatrixXd _e;  //_wSPlusWMuWMuT - I
   MatrixXd _cholInvKmmEKmn;
-  MatrixXd _s; //cholInvKmmEKmn * x
+  MatrixXd _s;  //cholInvKmmEKmn * x
   MatrixXd _eKnm;
-  MatrixXd _f; //(cholInvKmm'*((cholInvKmm*kKnm').*psi)*cholInvKmm).*Kmm
+  MatrixXd _f;  //(cholInvKmm'*((cholInvKmm*kKnm').*psi)*cholInvKmm).*Kmm
   MatrixXd _ff;
 
 public:
@@ -534,14 +584,11 @@ public:
     _updates[config._epochOffset] = _curEpoch;
     _updates[config._timeOffset]  = _time;
 
-    //high_resolution_clock::time_point waitStart = high_resolution_clock::now();
     _ts.push(_kvPtr->Push(_keys, _updates, {}, _curEpoch));
     while (_ts.size() >= (size_t) config._maxPush) {
       _kvPtr->Wait(_ts.front());
       _ts.pop();
     }
-    //duration<double> waitDur = high_resolution_clock::now() - waitStart;
-    //_waitTime2 += waitDur.count();
   }
 
   void Process() {
@@ -566,16 +613,21 @@ public:
     _knm.noalias() =  _sf2 * _knm.unaryExpr(_exp);
 
     _invCholInvKmm = _kmm.reverse().llt().matrixU();
-    std::reverse(_invCholInvKmm.data(), _invCholInvKmm.data() + _invCholInvKmm.size());
+    std::reverse(_invCholInvKmm.data(), _invCholInvKmm.data()
+                 + _invCholInvKmm.size());
     _cholInvKmm = MatrixXd::Identity(config._m, config._m);
-    _invCholInvKmm.transpose().triangularView<Upper>().solveInPlace(_cholInvKmm);
+    _invCholInvKmm.transpose().triangularView<Upper>().solveInPlace(
+                                                              _cholInvKmm);
 
-    // basis function
+    // basis function. Eq. (11) in ADVGP paper 
     _phi.noalias()    = _knm * _cholInvKmm.transpose();
     _phi2.noalias()   = _phi.cwiseProduct(_phi);
     _phiPhi.noalias() = _phi.transpose() * _phi;
     _yPhi.noalias()   = _y.transpose() * _phi;
 
+    // _e = _wS + wMu *wMu^T - I.
+    // Regroup the term with phi_i * (...) * phi_i^T in Eq. (1) (4) (5)
+    // in ADVGP paper. _e is the (...) part
     _e.noalias() = _wSPlusWMuWMuT;
     _e.diagonal().array() -= 1.0;
     
@@ -588,35 +640,37 @@ public:
 
     _eKnm.noalias() =  _e * (_phi.transpose() * _knm)
       - _wMu * (_y.transpose() * _knm);
-  
-    _f.noalias()    = (_cholInvKmm.transpose() * (_cholInvKmm * _eKnm.transpose()).cwiseProduct(_psi) 
+
+    // Eq. (8) in ADVGP appendix
+    _f.noalias()    = (_cholInvKmm.transpose() * (
+                  _cholInvKmm * _eKnm.transpose()).cwiseProduct(_psi) 
                   * _cholInvKmm).cwiseProduct(_kmm);
     _ff.noalias()   = _f + _f.transpose();
 
-    // g : local loss
+    // g : local loss. Eq. (1) in ADVGP Appendix
     _loss = 0.5 * (_n * log(2.0 * M_PI) + _n * log(_sn2) +
           (_y.dot(_y) - 2.0 * _yPhi.dot(_wMu) + 
           _phiPhi.cwiseProduct(_wSPlusWMuWMuT).sum() +
           _sf2 * _n - _phi2.sum()) / _sn2);
 
-    // d g / d ln(sn)
+    // d g / d ln(sn). Eq. (4) in ADVGP Appendix
     _gradLnSn = _n - (_y.dot(_y) - 2.0 * _yPhi.dot(_wMu) +
           _phiPhi.cwiseProduct(_wSPlusWMuWMuT).sum() + 
           _sf2 * _n - _phi2.sum()) / _sn2;
 
-    // d g / d ln(ell)
+    // d g / d ln(ell). Eq. (10) in ADVGP Appendix
     _gradLnEll.noalias() = (2.0 * _s.cwiseProduct(_b).colwise().sum() -
         _cholInvKmmEKmn.colwise().sum() * _x2 - 
         _cholInvKmmEKmn.rowwise().sum().transpose() * _b2 -
         _b.cwiseProduct(_ff * _b).colwise().sum() +
         _ff.colwise().sum() * _b2).transpose().cwiseProduct(_eta) / -_sn2;
 
-    // d g / d ln(sf)
+    // d g / d ln(sf). Eq. (5) in ADVGP Appendix
     _gradLnSf = (-_yPhi.dot(_wMu) +
           _phiPhi.cwiseProduct(_wSPlusWMuWMuT).sum() +
           _sf2 * _n - _phi2.sum()) / _sn2;
 
-    // d g / d b
+    // d g / d b. Eq(6) in ADVGP Appendix
     _gradB.noalias() = (_s * _eta.asDiagonal() - _cholInvKmmEKmn
           .rowwise().sum().replicate(1, config._d).cwiseProduct(_bEta) -
           _ff * _bEta +
@@ -638,6 +692,8 @@ public:
 
 };
 
+// a structure for outputs
+// TODO: can be replaced with protobuf
 struct Record {
 public:
   double _g;
@@ -653,6 +709,10 @@ public:
 };
 
 
+// A monitor just can either monitor the progress of the trainer
+// or work as a tester to test new dataset
+// derivations not mentioned in the paper
+// Please see matlab code pred.m for derivations
 class MyMonitor : public MyWorker {
 protected:
   MatrixXd _x;      // n * d
@@ -756,9 +816,11 @@ public:
       _knm.noalias() =  _sf2 * _knm.unaryExpr(_exp);
 
       _invCholInvKmm = _kmm.reverse().llt().matrixU();
-      std::reverse(_invCholInvKmm.data(), _invCholInvKmm.data() + _invCholInvKmm.size());
+      std::reverse(_invCholInvKmm.data(), _invCholInvKmm.data() 
+                                          + _invCholInvKmm.size());
       _cholInvKmm = MatrixXd::Identity(config._m, config._m);
-      _invCholInvKmm.transpose().triangularView<Upper>().solveInPlace(_cholInvKmm);
+      _invCholInvKmm.transpose().triangularView<Upper>().solveInPlace(
+                                                              _cholInvKmm);
 
       // basis function
       _phi.noalias()    = _knm * _cholInvKmm.transpose();

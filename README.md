@@ -5,9 +5,10 @@ Accepted by Thirty-fourth International Conference on Machine Learning (ICML 201
 
 Warning: this is only an experimental code.
 
-How to use:
-Copy folder gp/ and file Makefile to ps-liter.
-Go to folder ps-lite and compile using "make".
+Intallation guide:
+Copy folder gp/ and file Makefile to ps-lite.
+In ADVGP folder: export CPLUS_INCLUDE_PATH=$PWD/eigen
+Go to folder ps-lite and compile using make/cmake. PS-lite may use wget to download some other softwares. See more information about ps-lite about how to install ps-lite
 Go to folder ps-lite/gp/, test with "run.sh"
 
 Contact:
