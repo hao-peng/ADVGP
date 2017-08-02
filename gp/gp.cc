@@ -5,6 +5,7 @@
 #include <fstream>
 #include <map>
 #include <chrono>
+#include <functional>
 
 using namespace ps;
 using namespace Eigen; 
@@ -379,7 +380,8 @@ protected:
 
   int _curEpoch;
 
-  double (*_exp) (double);
+  std::pointer_to_unary_function <double, double> _exp;
+//  double (*_exp) (double);
 
   // dataFilePath contains the data with N rows and (D+1) cols.
   // The last col is the response variable
@@ -426,7 +428,7 @@ public:
 
     _curEpoch = -1;
 
-    _exp = &std::exp; // pointer to exp(double) function
+    _exp = std::ptr_fun<double, double>(std::exp); // pointer to exp(double) function
   }
 
   virtual ~MyWorker() {
